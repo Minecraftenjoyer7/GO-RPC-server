@@ -9,8 +9,10 @@ import (
 	"io"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 const (
@@ -39,6 +41,7 @@ type Server struct {
 	acceptDone chan struct{}
 	workers    sync.WaitGroup
 	mu         sync.Mutex
+	running    bool // <-- i added this so that i know if start was already called or not
 }
 
 // NewServer creates a server for a non-nil pointer receiver.
@@ -53,24 +56,83 @@ func NewServer(receiver any) (*Server, error) {
 	return &Server{receiver: receiver}, nil
 }
 
+func (s *Server) acceptLoop(listener net.Listener) {
+	defer close(s.acceptDone)
+	for {
+		connection, err := listener.Accept()
+		if err != nil { // <-- listener closed by stop so i did a return
+			return
+		}
+		s.workers.Add(1)
+		go func() {
+			defer s.workers.Done()
+			s.handle(connection)
+		}()
+	}
+}
+
 // TODO 1: Create the TCP listener, reject duplicate starts, save lifecycle state,
 // and launch the accept loop without blocking the caller.
 // Start begins accepting remote calls at address. Use port 0 to request an available port.
 func (s *Server) Start(address string) error {
-	return errors.New("TODO: implement Server.Start")
+	s.mu.Lock()
+	if s.running {
+		s.mu.Unlock()
+		return errors.New("server already started")
+	}
+
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
+
+	s.listener = listener
+	s.stopped = make(chan struct{})
+	s.acceptDone = make(chan struct{})
+	s.running = true
+	s.mu.Unlock()
+
+	go s.acceptLoop(listener)
+	return nil
 }
 
 // TODO 2: Return the listener address safely while allowing port 0 discovery.
 // Address returns the address assigned to the running server.
 func (s *Server) Address() string {
-	return ""
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.running || s.listener == nil {
+		return ""
+	}
+	return s.listener.Addr().String()
 }
 
 // TODO 3: Close the listener, signal the accept loop, wait for its workers,
 // and leave the server in a state where Start can be called again.
 // Stop stops accepting new connections and waits for active handlers to finish.
 func (s *Server) Stop() error {
-	return errors.New("TODO: implement Server.Stop")
+	s.mu.Lock()
+	if !s.running {
+		s.mu.Unlock()
+		return nil
+	}
+	s.running = false
+	stopped := s.stopped
+	acceptDone := s.acceptDone
+	listener := s.listener
+	s.listener = nil
+	s.mu.Unlock()
+
+	// Signal the accept loop, then close the listener to unblock Accept.
+	close(stopped)
+	_ = listener.Close()
+
+	<-acceptDone // Wait for the accept loop to exit
+
+	s.workers.Wait() // Wait for all active handlers to finish
+
+	return nil
 }
 
 // TODO 4: Study this starter request handler, then complete and test the protocol
@@ -115,7 +177,29 @@ func (s *Server) handle(connection net.Conn) {
 // larger than maxArgumentBytes, and requests larger than maxRequestBytes.
 // validateRequest rejects malformed or abusive requests before reflection runs.
 func validateRequest(req request) error {
-	return errors.New("TODO: implement validateRequest")
+	if req.Method == "" {
+		return errors.New("method cannot be empty")
+	}
+	if strings.IndexFunc(req.Method, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r)
+	}) != -1 {
+		return errors.New("method name cannot contain whitespace or control characters")
+	}
+	if len(req.Args) > maxArguments {
+		return errors.New("too many arguments")
+	}
+
+	total := 0
+	for i, arg := range req.Args {
+		if len(arg) > maxArgumentBytes {
+			return fmt.Errorf("argument %d is larger than allowed", i)
+		}
+		total += len(arg)
+	}
+	if total > maxRequestBytes {
+		return errors.New("request is larger than allowed")
+	}
+	return nil
 }
 
 // TODO 6: Study and test this starter reflection bridge. Your required work is to
@@ -197,5 +281,45 @@ func NewClient(address string) (*Client, error) {
 // response, return remote errors, and decode the response into out.
 // Call invokes method and decodes its result into out. Pass nil for no result.
 func (c *Client) Call(method string, out any, args ...any) error {
-	return errors.New("TODO: implement Client.Call")
+	if method == "" {
+		return errors.New("method cannot be empty")
+	}
+
+	connection, err := net.DialTimeout("tcp", c.Address, c.Timeout) // Open one connection to the server
+	if err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	defer connection.Close()
+
+	_ = connection.SetDeadline(time.Now().Add(c.Timeout)) // Apply the timeout to all reads/writes on this connection
+
+	rawArgs := make([]json.RawMessage, len(args)) // Encode the args
+	for i, arg := range args {
+		raw, err := json.Marshal(arg)
+		if err != nil {
+			return fmt.Errorf("encode argument %d: %w", i, err)
+		}
+		rawArgs[i] = raw
+	}
+
+	req := request{Method: method, Args: rawArgs} // Send the request
+	if err := json.NewEncoder(connection).Encode(req); err != nil {
+		return fmt.Errorf("send request: %w", err)
+	}
+
+	var resp response
+	if err := json.NewDecoder(bufio.NewReader(connection)).Decode(&resp); err != nil { // Read the response
+		return fmt.Errorf("decode response: %w", err)
+	}
+	if !resp.OK {
+		return errors.New(resp.Error)
+	}
+
+	if out == nil || len(resp.Value) == 0 { // Decode the result into out, unless out is nil or there is no value
+		return nil
+	}
+	if err := json.Unmarshal(resp.Value, out); err != nil {
+		return fmt.Errorf("decode result: %w", err)
+	}
+	return nil
 }
